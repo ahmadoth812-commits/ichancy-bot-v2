@@ -1,0 +1,8 @@
+python-telegram-bot==20.3
+mysql-connector-python
+playwright
+cryptography
+fastapi
+uvicorn
+jinja2
+python-dotenv
