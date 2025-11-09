@@ -1,139 +1,139 @@
-# handlers/syriatel_cash_deposit.py
-
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    ReplyKeyboardRemove
-)
+# handlers/syriatelcash_deposit.py
+import logging
+from datetime import datetime
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ContextTypes,
-    ConversationHandler,
     CallbackQueryHandler,
     MessageHandler,
-    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
-import asyncio
-import Logger
 import store
-from services.transaction_notification_service import transaction_notification_service
+import config
 
-logger = Logger.getLogger()
+logger = logging.getLogger(__name__)
 
-# تعريف الحالات في المحادثة
-SELECT_AMOUNT, ENTER_TRANSFER_NUM = range(2)
+# Conversation states
+AMOUNT, TXID = range(2)
 
-# ⚙️ عرض أرقام التحويل (تأتي من إعدادات قاعدة البيانات)
-def get_syriatel_numbers():
-    """إرجاع قائمة أرقام التحويل من إعدادات DB"""
+ADMIN_IDS = getattr(config, "ADMIN_IDS", [])
+MIN_AMOUNT = getattr(config, "SYRIATEL_MIN_AMOUNT", 25000)
+
+async def start_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    numbers = store.get_syriatel_numbers()
+    text = (
+        "📱 الرجاء التحويل إلى أحد الأرقام التالية يدويًا:\n"
+        + "\n".join(f"• {n}" for n in numbers)
+        + f"\n\n💵 أقل مبلغ هو {MIN_AMOUNT} SYP"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ تم التحويل", callback_data="syriatel_done")]])
+    await update.effective_chat.send_message(text, reply_markup=kb)
+    return AMOUNT
+
+
+async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.effective_chat.send_message("💰 الرجاء إدخال المبلغ الذي قمت بتحويله:")
+    return AMOUNT
+
+
+async def ask_txid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        settings = store.get_admin_settings()
-        return settings.get("syriatel_numbers", ["83935571", "00229271"])
-    except Exception as e:
-        logger.error(f"Error fetching Syriatel numbers: {e}")
-        return ["83935571", "00229271"]
+        amount = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح.")
+        return AMOUNT
+    if amount < MIN_AMOUNT:
+        await update.message.reply_text(f"⚠️ أقل مبلغ هو {MIN_AMOUNT} SYP.")
+        return AMOUNT
+    context.user_data["amount"] = amount
+    await update.message.reply_text("🔢 الرجاء إدخال رقم عملية التحويل (Transaction ID):")
+    return TXID
 
-# ⬇️ دالة بدء عملية الشحن
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
 
-    if query.data == "syriatel_cash_deposit":
-        numbers = get_syriatel_numbers()
-        message_text = (
-            "🔹 *الرجاء التحويل إلى أحد الأرقام التالية بطريقة التحويل اليدوي:*\n\n"
-            f"📱 {numbers[0]}\n"
-            f"📱 {numbers[1]}\n\n"
-            "⚠️ *أقل قيمة للشحن هي 25,000 SYP*\n"
-            "يرجى عدم إرسال مبالغ أقل لأنها لن تُقبل أو تُسترجع.\n\n"
-            "بعد التحويل، اضغط الزر أدناه 👇"
-        )
-        keyboard = [[InlineKeyboardButton("تم التحويل ✅", callback_data="confirm_transfer")]]
-        await query.edit_message_text(
-            text=message_text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txid = update.message.text.strip()
+    amount = context.user_data["amount"]
+    user = store.getUserByTelegramId(str(update.effective_user.id))
+    if not user:
+        await update.message.reply_text("⚠️ حسابك غير مسجل.")
         return ConversationHandler.END
 
-# ⬇️ بدء إدخال المبلغ بعد الضغط على "تم التحويل"
-async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    db = store.getDatabaseConnection()
+    cur = db.cursor()
+    cur.execute("""
+        INSERT INTO syriatel_transactions (user_id, amount, txid, status, created_at)
+        VALUES (%s,%s,%s,%s,%s)
+    """, (user["id"], amount, txid, "pending", datetime.now()))
+    tx_id = cur.lastrowid
+    db.commit()
+    db.close()
 
-    await query.edit_message_text("💰 *يرجى إدخال قيمة المبلغ الذي قمت بتحويله (SYP):*", parse_mode="Markdown")
-    return SELECT_AMOUNT
+    store.add_audit_log("syriatel", tx_id, "pending", "User submitted deposit")
 
-# ⬇️ استلام المبلغ من المستخدم
-async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit() or int(text) < 25000:
-        await update.message.reply_text("⚠️ المبلغ غير صالح. الرجاء إدخال مبلغ رقمي لا يقل عن 25,000 SYP.")
-        return SELECT_AMOUNT
-
-    context.user_data["amount"] = int(text)
-    await update.message.reply_text("🔢 *يرجى إدخال رقم عملية التحويل:*", parse_mode="Markdown")
-    return ENTER_TRANSFER_NUM
-
-# ⬇️ استلام رقم عملية التحويل
-async def get_transfer_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    transfer_num = update.message.text.strip()
-    amount = context.user_data.get("amount")
-    telegram_user_id = str(update.effective_user.id)
-
-    # حفظ المعاملة في قاعدة البيانات
-    try:
-        transaction_id = store.insertTransaction(
-            telegram_id=telegram_user_id,
-            value=amount,
-            action_type="deposit",
-            provider_type="syriatel",
-            transfer_num=transfer_num,
-        )
-
-        context.user_data["transaction_id"] = transaction_id
-        logger.info(f"Inserted new Syriatel transaction #{transaction_id} for {telegram_user_id}")
-
-        # إشعار الأدمن تلقائيًا
-        asyncio.create_task(
-            transaction_notification_service.notify_admin_new_transaction(transaction_id, "syriatel")
-        )
-
-        # رسالة تأكيد للمستخدم
-        summary = (
-            "✅ *تم إرسال طلبك للمراجعة من قبل الإدارة.*\n\n"
-            "📦 *تفاصيل العملية:*\n"
-            f"🔹 رقم العملية: `{transfer_num}`\n"
-            f"💰 المبلغ: {amount:,} SYP\n"
-            f"🆔 رقم الطلب: #{transaction_id}\n\n"
-            "⏳ سيتم إشعارك بعد مراجعة طلبك من قبل الأدمن."
-        )
-
-        await update.message.reply_text(summary, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error creating Syriatel transaction: {e}")
-        await update.message.reply_text("⚠️ حدث خطأ أثناء تسجيل العملية. حاول لاحقًا.")
-
-    # تنظيف بيانات المستخدم من الجلسة
+    await update.message.reply_text("✅ تم تسجيل عملية الإيداع قيد المراجعة.")
     context.user_data.clear()
-    return ConversationHandler.END
 
-# ⬇️ دالة الإلغاء
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 تم إلغاء عملية الشحن.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-# ⬇️ إنشاء ConversationHandler للربط مع البوت
-def conversation_handler():
-    return ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(button_handler, pattern="^syriatel_cash_deposit$"),
-            CallbackQueryHandler(confirm_transfer, pattern="^confirm_transfer$"),
-        ],
-        states={
-            SELECT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount)],
-            ENTER_TRANSFER_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_transfer_number)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
+    msg = (
+        f"🔔 طلب إيداع جديد عبر Syriatel Cash\n"
+        f"👤 المستخدم: @{update.effective_user.username or update.effective_user.full_name}\n"
+        f"💰 المبلغ: {amount} SYP\n"
+        f"🆔 معرف العملية: `{txid}`"
     )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ موافقة", callback_data=f"admin_approve_syr:{tx_id}")],
+        [InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject_syr:{tx_id}")]
+    ])
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin, msg, reply_markup=kb, parse_mode="Markdown")
+        except:
+            pass
+    return ConversationHandler.END
+
+
+async def admin_approve_syr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if int(q.from_user.id) not in ADMIN_IDS:
+        return await q.answer("❌ غير مصرح.")
+    tx_id = int(q.data.split(":")[1])
+    tx = store.get_transaction("syriatel_transactions", tx_id)
+    user_id = tx["user_id"]
+
+    store.add_balance(user_id, tx["amount"])
+    store.update_transaction_status("syriatel_transactions", tx_id, "approved")
+    store.add_audit_log("syriatel", tx_id, "approved", "Admin approved deposit")
+
+    tg = store.get_user_telegram_by_id(user_id)
+    if tg:
+        await context.bot.send_message(tg, f"✅ تمت الموافقة على إيداعك #{tx_id}.")
+    await q.edit_message_text(f"تمت الموافقة على العملية #{tx_id}.")
+
+
+async def admin_reject_syr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tx_id = int(q.data.split(":")[1])
+    store.update_transaction_status("syriatel_transactions", tx_id, "rejected")
+    store.add_audit_log("syriatel", tx_id, "rejected", "Admin rejected deposit")
+    await q.edit_message_text(f"🚫 تم رفض العملية #{tx_id}.")
+
+
+def register_handlers(dp):
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_deposit, pattern="^syriatel_deposit$")],
+        states={
+            AMOUNT: [
+                CallbackQueryHandler(ask_amount, pattern="^syriatel_done$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_txid)
+            ],
+            TXID: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize)],
+        },
+        fallbacks=[],
+    )
+    dp.add_handler(conv)
+    dp.add_handler(CallbackQueryHandler(admin_approve_syr, pattern="^admin_approve_syr"))
+    dp.add_handler(CallbackQueryHandler(admin_reject_syr, pattern="^admin_reject_syr"))
