@@ -1,177 +1,168 @@
 # handlers/coinex_deposit.py
-import aiohttp
-import hashlib
+import os
 import hmac
-import time
 import json
-import sqlite3
-from aiogram import types, Router
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from config import COINEX_API_KEY, COINEX_SECRET_KEY
-from utils.fernet_utils import fernet_decrypt
-from database.store import get_user_balance, update_user_balance
+import time
+import hashlib
+import logging
+import aiohttp
+from datetime import datetime
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+import store
+from fernet_utils import decrypt_secret
 
-router = Router()
+logger = logging.getLogger(__name__)
 
-# إعداد المفاتيح من env (مشفرة مسبقاً)
-API_KEY = fernet_decrypt(COINEX_API_KEY)
-SECRET_KEY = fernet_decrypt(COINEX_SECRET_KEY)
+# Conversation states
+SELECT_CHAIN, CONFIRM_TRANSFER = range(2)
 
-COINEX_BASE_URL = "https://api.coinex.com/v2"
+# Load decrypted API keys
+API_KEY = decrypt_secret(os.getenv("COINEX_API_KEY"))
+API_SECRET = decrypt_secret(os.getenv("COINEX_API_SECRET"))
+
 SUPPORTED_CHAINS = ["BEP20", "TRC20"]
 
-DB_PATH = "database/ichancy.db"
+# Helper function to create CoinEx signature
+def sign_request(params: dict, secret: str) -> str:
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+async def start_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask the user which chain they want to use (BEP20 or TRC20)."""
+    await update.callback_query.answer()
+    text = "🌐 اختر نوع السلسلة التي ترغب بالإيداع من خلالها:"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 BEP20", callback_data="coinex_chain_BEP20")],
+        [InlineKeyboardButton("🔵 TRC20", callback_data="coinex_chain_TRC20")]
+    ])
+    await update.effective_chat.send_message(text, reply_markup=kb)
+    return SELECT_CHAIN
 
 
-# === دوال مساعدة ===
-def generate_signature(payload: dict, secret_key: str) -> str:
-    """
-    إنشاء توقيع HMAC SHA256 بناءً على وثائق CoinEx v2
-    """
-    sorted_params = sorted(payload.items())
-    query = "&".join(f"{k}={v}" for k, v in sorted_params)
-    sign = hmac.new(secret_key.encode(), query.encode(), hashlib.sha256).hexdigest().upper()
-    return sign
+async def get_deposit_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch deposit address for the chosen chain from CoinEx."""
+    query = update.callback_query
+    await query.answer()
 
+    chain = query.data.split("_")[-1]
+    if chain not in SUPPORTED_CHAINS:
+        return await query.edit_message_text("❌ سلسلة غير مدعومة.")
+    context.user_data["chain"] = chain
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-async def get_cached_address(user_id: int, chain: str):
-    """
-    فحص إن كان لدى المستخدم عنوان محفوظ سابقًا لنفس السلسلة
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT address FROM coinex_deposit_addresses WHERE user_id=? AND chain=?",
-        (user_id, chain),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row["address"] if row else None
-
-
-async def cache_address(user_id: int, chain: str, address: str):
-    """
-    تخزين عنوان الإيداع في قاعدة البيانات
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO coinex_deposit_addresses (user_id, chain, address, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, chain, address, int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-
-
-async def get_deposit_address(chain: str):
-    """
-    جلب عنوان الإيداع من CoinEx API
-    """
-    url = f"{COINEX_BASE_URL}/account/deposit/address"
-    payload = {
+    # Prepare API request
+    url = "https://api.coinex.com/v2/sub_account/deposit_address"
+    params = {
         "access_id": API_KEY,
-        "tonce": int(time.time() * 1000),
+        "timestamp": int(time.time() * 1000),
         "coin_type": "USDT",
         "smart_contract_name": chain,
     }
-    payload["signature"] = generate_signature(payload, SECRET_KEY)
+    sign = sign_request(params, API_SECRET)
+    headers = {"Authorization": sign}
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=payload) as resp:
+        async with session.post(url, data=params, headers=headers) as resp:
             data = await resp.json()
-            if "data" in data and "url" in data["data"]:
-                return data["data"]["url"]
-            elif "data" in data and "address" in data["data"]:
-                return data["data"]["address"]
-            else:
-                return None
-
-
-# === واجهة المستخدم ===
-@router.message(Command("deposit_coinex"))
-async def start_coinex_deposit(message: types.Message):
-    """
-    عرض واجهة اختيار السلسلة للإيداع
-    """
-    builder = InlineKeyboardBuilder()
-    for chain in SUPPORTED_CHAINS:
-        builder.button(text=f"💰 إيداع USDT ({chain})", callback_data=f"coinex_deposit_{chain}")
-    builder.adjust(1)
-    await message.answer(
-        "يرجى اختيار السلسلة التي تريد الإيداع عليها:",
-        reply_markup=builder.as_markup()
-    )
-
-
-@router.callback_query(lambda c: c.data.startswith("coinex_deposit_"))
-async def process_deposit_callback(call: types.CallbackQuery):
-    """
-    بعد اختيار السلسلة، يتم جلب عنوان الإيداع المناسب من CoinEx أو من الكاش
-    """
-    user_id = call.from_user.id
-    chain = call.data.split("_")[-1]
-
-    await call.message.edit_text("⏳ جارٍ جلب عنوان الإيداع الخاص بك، يرجى الانتظار...")
-
-    # فحص الكاش أولاً
-    address = await get_cached_address(user_id, chain)
-    if not address:
-        address = await get_deposit_address(chain)
-        if address:
-            await cache_address(user_id, chain, address)
-        else:
-            await call.message.answer("⚠️ لم نتمكن من جلب عنوان الإيداع. حاول لاحقاً.")
-            return
+            if data.get("code") != 0:
+                return await query.edit_message_text("⚠️ تعذر جلب عنوان الإيداع. حاول لاحقًا.")
+            addr = data["data"]["address"]
 
     text = (
-        f"✅ يمكنك الآن إرسال USDT إلى العنوان التالي:\n\n"
-        f"<b>{address}</b>\n\n"
-        f"السلسلة: <b>{chain}</b>\n"
-        f"العملة: <b>USDT</b>\n\n"
-        f"📌 بعد الإيداع، أرسل معرف المعاملة (TXID) ليتم التحقق التلقائي.\n"
-        f"⏳ قد تستغرق العملية بضع دقائق حتى يتم تأكيدها على البلوكشين."
+        f"💵 قم بإرسال المبلغ الذي ترغب بإيداعه إلى العنوان التالي على شبكة {chain}:\n\n"
+        f"`{addr}`\n\n"
+        "بعد الإرسال، اضغط على الزر أدناه لإعلام البوت بالتحويل."
     )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ تم الإرسال", callback_data="coinex_sent")]])
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+    return CONFIRM_TRANSFER
 
-    await call.message.answer(text, parse_mode="HTML")
 
+async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check CoinEx deposit history for new transaction matching user."""
+    q = update.callback_query
+    await q.answer()
+    user = store.getUserByTelegramId(str(q.from_user.id))
+    if not user:
+        await q.edit_message_text("⚠️ حسابك غير مسجل. استخدم /start أولاً.")
+        return ConversationHandler.END
 
-# === التحقق من الإيداعات تلقائيًا (اختياري) ===
-async def verify_deposit(txid: str, user_id: int, chain: str):
-    """
-    التحقق من الإيداع عبر CoinEx API بعد أن يرسل المستخدم txid.
-    يمكن تشغيلها دورياً عبر scheduler.
-    """
-    url = f"{COINEX_BASE_URL}/account/deposit/history"
-    payload = {
+    chain = context.user_data.get("chain", "BEP20")
+
+    # Fetch deposits from CoinEx
+    url = "https://api.coinex.com/v2/deposit_history"
+    params = {
         "access_id": API_KEY,
-        "tonce": int(time.time() * 1000),
+        "timestamp": int(time.time() * 1000),
         "coin_type": "USDT",
     }
-    payload["signature"] = generate_signature(payload, SECRET_KEY)
+    sign = sign_request(params, API_SECRET)
+    headers = {"Authorization": sign}
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=payload) as resp:
+        async with session.get(url, params=params, headers=headers) as resp:
             data = await resp.json()
-            deposits = data.get("data", {}).get("records", [])
 
-            for dep in deposits:
-                if dep["tx_id"] == txid and dep["smart_contract_name"] == chain:
-                    # تحقق ناجح
-                    amount_usdt = float(dep["amount"])
-                    conn = get_db_connection()
-                    conn.execute(
-                        "INSERT INTO deposits (user_id, txid, chain, amount_usdt, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (user_id, txid, chain, amount_usdt, "confirmed", int(time.time())),
-                    )
-                    conn.commit()
-                    conn.close()
-                    await update_user_balance(user_id, amount_usdt)
-                    return True
-    return False
+    deposits = data.get("data", {}).get("data", [])
+    if not deposits:
+        await q.edit_message_text("⌛ لم يتم العثور على أي عملية إيداع جديدة بعد، يرجى الانتظار قليلاً.")
+        return ConversationHandler.END
+
+    # Simulate matching logic by latest transaction (can be refined)
+    latest_tx = deposits[0]
+    txid = latest_tx["tx_id"]
+    amount = float(latest_tx["amount"])
+    status = latest_tx["status"]
+    if status != "FINISHED":
+        await q.edit_message_text("⚠️ العملية لم تكتمل بعد، حاول بعد قليل.")
+        return ConversationHandler.END
+
+    # Convert USD → NSP
+    rate = store.get_usd_to_nsp_rate()
+    nsp_value = int(amount * rate)
+
+    # Store transaction
+    db = store.getDatabaseConnection()
+    cur = db.cursor()
+    cur.execute("""
+        INSERT INTO coinex_transactions (user_id, chain, usdt_amount, nsp_value, txid, status, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, (user["id"], chain, amount, nsp_value, txid, "approved", datetime.now()))
+    tx_id = cur.lastrowid
+    db.commit()
+    db.close()
+
+    # Add to balance
+    store.add_balance(user["id"], nsp_value)
+    store.add_audit_log("coinex", tx_id, "approved", f"Auto deposit confirmed from {chain}")
+
+    await q.edit_message_text(
+        f"✅ تم تأكيد الإيداع بنجاح!\n"
+        f"💰 المبلغ: {amount} USDT ({nsp_value} NSP)\n"
+        f"🔗 السلسلة: {chain}\n"
+        f"🆔 TxID: `{txid}`",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+def register_handlers(dp):
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_deposit, pattern="^coinex_deposit$")],
+        states={
+            SELECT_CHAIN: [CallbackQueryHandler(get_deposit_address, pattern="^coinex_chain_")],
+            CONFIRM_TRANSFER: [CallbackQueryHandler(confirm_transfer, pattern="^coinex_sent$")],
+        },
+        fallbacks=[],
+    )
+    dp.add_handler(conv)
