@@ -1,219 +1,256 @@
 # handlers/coinex_withdraw.py
-import aiohttp
-import hashlib
-import hmac
-import time
-import sqlite3
-from aiogram import types, Router
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from config import COINEX_API_KEY, COINEX_SECRET_KEY
-from utils.fernet_utils import fernet_decrypt
-from database.store import get_user_balance, update_user_balance
+import logging
+from datetime import datetime
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, MessageHandler, ConversationHandler, ContextTypes, filters
+import store, config
+from coinex_adapter import CoinExClient
 
-router = Router()
+logger = logging.getLogger(__name__)
 
-API_KEY = fernet_decrypt(COINEX_API_KEY)
-SECRET_KEY = fernet_decrypt(COINEX_SECRET_KEY)
-COINEX_BASE_URL = "https://api.coinex.com/v2"
-SUPPORTED_CHAINS = ["BEP20", "TRC20"]
+# Conversation states
+AMOUNT, CHAIN, ADDRESS, CONFIRM = range(4)
 
-DB_PATH = "database/ichancy.db"
-WITHDRAW_MIN = 10.0  # الحد الأدنى للسحب بالدولار
-BOT_FEE_PERCENT = 10  # نسبة العمولة لصالح البوت
+# Configuration
+ADMIN_IDS = getattr(config, "ADMIN_IDS", [])
+MIN_WITHDRAW_NSP = getattr(config, "COINEX_MIN_WITHDRAW_NSP", 10000)
+FEE_PERCENT = getattr(config, "COINEX_FEE_PERCENT", 0.0)  # optional extra platform fee
 
+def _client():
+    return CoinExClient(api_key=config.COINEX_API_KEY, api_secret=config.COINEX_API_SECRET)
 
-# ======================== دوال مساعدة عامة ========================
-def generate_signature(payload: dict, secret_key: str) -> str:
-    """إنشاء توقيع HMAC SHA256 بناءً على توثيق CoinEx v2"""
-    sorted_params = sorted(payload.items())
-    query = "&".join(f"{k}={v}" for k, v in sorted_params)
-    sign = hmac.new(secret_key.encode(), query.encode(), hashlib.sha256).hexdigest().upper()
-    return sign
+# ========== USER FLOW ==========
 
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-async def record_withdraw_request(user_id, amount, net_amount, chain, address, txid=None, status="pending", reason=None):
-    conn = get_db_connection()
-    conn.execute("""
-        INSERT INTO coinex_withdrawals (user_id, amount_usdt, net_amount_usdt, chain, address, txid, status, reason, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, amount, net_amount, chain, address, txid, status, reason, int(time.time())))
-    conn.commit()
-    conn.close()
-
-
-async def freeze_user_balance(user_id: int, amount: float):
-    """تجميد الرصيد مؤقتاً أثناء انتظار موافقة الأدمن"""
-    conn = get_db_connection()
-    conn.execute("UPDATE users SET frozen_balance = frozen_balance + ?, balance = balance - ? WHERE user_id=?",
-                 (amount, amount, user_id))
-    conn.commit()
-    conn.close()
-
-
-async def unfreeze_user_balance(user_id: int, amount: float):
-    """إلغاء التجميد في حال الرفض أو الفشل"""
-    conn = get_db_connection()
-    conn.execute("UPDATE users SET frozen_balance = frozen_balance - ? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-
-async def approve_withdraw_request(request_id: int, txid: str):
-    """تأكيد عملية السحب من قبل الأدمن"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM coinex_withdrawals WHERE id=?", (request_id,))
-    req = cur.fetchone()
-    if not req:
-        conn.close()
-        return False
-
-    conn.execute("""
-        UPDATE coinex_withdrawals
-        SET status=?, txid=?, reason=NULL
-        WHERE id=?
-    """, ("approved", txid, request_id))
-    conn.commit()
-
-    await unfreeze_user_balance(req["user_id"], req["net_amount_usdt"])
-    conn.close()
-    return True
-
-
-async def reject_withdraw_request(request_id: int, reason: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM coinex_withdrawals WHERE id=?", (request_id,))
-    req = cur.fetchone()
-    if not req:
-        conn.close()
-        return False
-
-    conn.execute("""
-        UPDATE coinex_withdrawals
-        SET status=?, reason=?
-        WHERE id=?
-    """, ("rejected", reason, request_id))
-    conn.commit()
-
-    # إعادة المبلغ للمستخدم
-    conn.execute("UPDATE users SET balance = balance + ?, frozen_balance = frozen_balance - ? WHERE user_id=?",
-                 (req["amount_usdt"], req["amount_usdt"], req["user_id"]))
-    conn.commit()
-    conn.close()
-    return True
-
-
-# ======================== whitelist التحقق من ========================
-def is_address_whitelisted(user_id: int, address: str, chain: str) -> bool:
-    """يتحقق إن كان العنوان مسجل مسبقاً في whitelist"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT 1 FROM user_whitelist_addresses
-        WHERE user_id = ? AND address = ? AND chain = ?
-    """, (user_id, address, chain))
-    result = cur.fetchone()
-    conn.close()
-    return result is not None
-
-
-# ======================== واجهة المستخدم ========================
-@router.message(Command("withdraw_coinex"))
-async def start_coinex_withdraw(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    for chain in SUPPORTED_CHAINS:
-        builder.button(text=f"🔻 سحب USDT ({chain})", callback_data=f"coinex_withdraw_{chain}")
-    builder.adjust(1)
-    await message.answer("💵 يرجى اختيار السلسلة التي ترغب السحب عليها:", reply_markup=builder.as_markup())
-
-
-@router.callback_query(lambda c: c.data.startswith("coinex_withdraw_"))
-async def handle_withdraw_chain(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    chain = call.data.split("_")[-1]
-    await call.message.answer(f"📤 أدخل المبلغ المراد سحبه (الحد الأدنى {WITHDRAW_MIN}$):")
-    await call.answer()
-    call.message.bot.session = {"chain": chain}
-
-
-@router.message(lambda m: m.text.replace('.', '', 1).isdigit())
-async def handle_withdraw_amount(message: types.Message):
-    user_id = message.from_user.id
-    amount = float(message.text)
-    balance = await get_user_balance(user_id)
-
-    if amount < WITHDRAW_MIN:
-        await message.answer(f"❌ الحد الأدنى للسحب هو {WITHDRAW_MIN}$")
-        return
-    if balance < amount:
-        await message.answer("❌ رصيدك غير كافٍ لإتمام عملية السحب.")
-        return
-
-    fee = amount * BOT_FEE_PERCENT / 100
-    net_amount = amount - fee
-
-    await message.answer(
-        f"💰 سيتم خصم عمولة {BOT_FEE_PERCENT}% = {fee}$\n"
-        f"المبلغ الصافي الذي سيُرسل إليك: {net_amount}$\n\n"
-        "📩 أرسل الآن عنوان محفظتك الذي تريد استلام المبلغ عليه:"
+async def start_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.effective_chat.send_message(
+        f"💸 سحب عبر CoinEx\n"
+        f"الحد الأدنى للسحب: {MIN_WITHDRAW_NSP} NSP\n"
+        f"الرجاء إدخال المبلغ بالـ NSP:"
     )
-
-    message.bot.session["amount"] = amount
-    message.bot.session["net_amount"] = net_amount
+    return AMOUNT
 
 
-@router.message(lambda m: m.text.startswith("0x") or m.text.startswith("T"))
-async def handle_withdraw_address(message: types.Message):
-    user_id = message.from_user.id
-    address = message.text
-    chain = message.bot.session.get("chain")
-    amount = message.bot.session.get("amount")
-    net_amount = message.bot.session.get("net_amount")
+async def ask_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask user to choose withdrawal chain (BEP20 / TRC20)"""
+    try:
+        amount = int(update.message.text.strip().replace(",", ""))
+    except:
+        await update.message.reply_text("❌ الرجاء إدخال رقم صالح.")
+        return AMOUNT
 
-    # ✅ تحقق من whitelist
-    if not is_address_whitelisted(user_id, address, chain):
-        await message.answer(
-            "⚠️ هذا العنوان غير مسجل في القائمة البيضاء (whitelist).\n"
-            "يرجى طلب إضافته عبر الأدمن قبل تنفيذ السحب."
+    if amount < MIN_WITHDRAW_NSP:
+        await update.message.reply_text(f"⚠️ الحد الأدنى للسحب هو {MIN_WITHDRAW_NSP} NSP.")
+        return AMOUNT
+
+    user = store.getUserByTelegramId(str(update.effective_user.id))
+    if not user:
+        await update.message.reply_text("⚠️ حسابك غير مسجل.")
+        return ConversationHandler.END
+
+    balance = store.get_user_balance(user["id"])
+    if amount > balance:
+        await update.message.reply_text(f"🚫 لا يوجد رصيد كافٍ. رصيدك الحالي: {balance} NSP.")
+        return ConversationHandler.END
+
+    context.user_data["amount_nsp"] = amount
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 BEP20", callback_data="chain_bep20"),
+         InlineKeyboardButton("🔵 TRC20", callback_data="chain_trc20")]
+    ])
+    await update.message.reply_text("🌐 اختر السلسلة المراد السحب عليها:", reply_markup=kb)
+    return CHAIN
+
+
+async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chain = "BEP20" if "bep20" in q.data else "TRC20"
+    context.user_data["chain"] = chain
+    await q.edit_message_text("📩 أدخل عنوان محفظة USDT المراد السحب إليها:")
+    return ADDRESS
+
+
+async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User enters withdrawal address and confirms"""
+    address = update.message.text.strip()
+    context.user_data["address"] = address
+    amount_nsp = context.user_data["amount_nsp"]
+
+    # ✅ تحقق من أن العنوان موجود في الـ whitelist
+    if not store.is_coinex_address_whitelisted(address):
+        await update.message.reply_text(
+            "⚠️ هذا العنوان غير مسجل في قائمة العناوين الموثوقة.\n"
+            "يرجى التواصل مع الإدارة لإضافته قبل طلب السحب."
         )
-        return
+        return ConversationHandler.END
 
-    await message.answer("⏳ جاري التحقق من البيانات وإرسال الطلب...")
+    # تحويل NSP → USDT
+    rate = store.get_usd_to_nsp_rate()
+    if not rate or rate <= 0:
+        await update.message.reply_text("⚠️ سعر التحويل غير متوفر حالياً. يرجى المحاولة لاحقاً.")
+        return ConversationHandler.END
 
-    await freeze_user_balance(user_id, amount)
-    await record_withdraw_request(user_id, amount, net_amount, chain, address)
+    usdt_amount = float("{:.6f}".format(amount_nsp / rate))
+    chain = context.user_data["chain"]
 
-    await message.answer(
-        "✅ تم تسجيل طلب السحب بنجاح.\n"
-        "⏱️ بانتظار موافقة الأدمن لإتمام العملية.\n\n"
-        f"🔗 السلسلة: {chain}\n💵 المبلغ الصافي: {net_amount}$\n📤 المحفظة: <code>{address}</code>",
-        parse_mode="HTML"
+    summary = (
+        f"📋 **ملخص طلب السحب:**\n\n"
+        f"💰 المبلغ (NSP): {amount_nsp}\n"
+        f"💵 ما يعادله (USDT): {usdt_amount}\n"
+        f"🔗 الشبكة: {chain}\n"
+        f"🏦 العنوان: `{address}`\n\n"
+        f"هل ترغب في إرسال الطلب للإدارة؟"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تأكيد", callback_data="withdraw_send")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="withdraw_cancel")]
+    ])
+    await update.message.reply_text(summary, reply_markup=kb, parse_mode="Markdown")
+    return CONFIRM
+
+
+async def submit_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirms and request is stored pending admin review"""
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "withdraw_cancel":
+        await q.edit_message_text("❎ تم إلغاء العملية.")
+        return ConversationHandler.END
+
+    user = store.getUserByTelegramId(str(q.from_user.id))
+    amount_nsp = context.user_data["amount_nsp"]
+    chain = context.user_data["chain"]
+    address = context.user_data["address"]
+
+    # خصم الرصيد (تجميد مؤقت حتى المراجعة)
+    store.deduct_balance(user["id"], amount_nsp)
+
+    # تحويل القيمة إلى USDT
+    rate = store.get_usd_to_nsp_rate()
+    usdt_amount = float("{:.6f}".format(amount_nsp / rate))
+
+    # حفظ الطلب في قاعدة البيانات
+    db = store.getDatabaseConnection()
+    cur = db.cursor()
+    cur.execute("""
+        INSERT INTO coinex_withdrawals (user_id, nsp_amount, usdt_amount, chain, address, status, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, (user["id"], amount_nsp, usdt_amount, chain, address, "pending", datetime.now()))
+    wid = cur.lastrowid
+    cur.execute("""
+        INSERT INTO transactions (user_id, provider_id, provider_type, value, action_type)
+        VALUES (%s,%s,%s,%s,%s)
+    """, (user["id"], wid, "coinex", amount_nsp, "withdraw"))
+    db.commit()
+    db.close()
+
+    store.add_audit_log("coinex_withdrawals", wid, "pending", "User submitted withdrawal request")
+
+    await q.edit_message_text("✅ تم تسجيل طلب السحب بنجاح، بانتظار موافقة الإدارة.")
+    context.user_data.clear()
+
+    # إشعار الأدمن
+    msg = (
+        f"🔔 **طلب سحب جديد عبر CoinEx**\n\n"
+        f"👤 المستخدم: @{q.from_user.username or q.from_user.full_name}\n"
+        f"💰 NSP: {amount_nsp} → USDT: {usdt_amount}\n"
+        f"🔗 الشبكة: {chain}\n"
+        f"🏦 العنوان: `{address}`\n"
+        f"🆔 رقم العملية: {wid}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ موافقة وتنفيذ آلي", callback_data=f"admin_coinex_approve:{wid}")],
+        [InlineKeyboardButton("❌ رفض", callback_data=f"admin_coinex_reject:{wid}")]
+    ])
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin, msg, reply_markup=kb, parse_mode="Markdown")
+        except:
+            pass
+
+    return ConversationHandler.END
+
+# ========== ADMIN FLOW ==========
+
+async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin approves and triggers automatic CoinEx withdrawal"""
+    q = update.callback_query
+    await q.answer()
+    if int(q.from_user.id) not in ADMIN_IDS:
+        return await q.answer("❌ غير مصرح.")
+
+    wid = int(q.data.split(":")[1])
+    tx = store.get_transaction("coinex_withdrawals", wid)
+    if not tx:
+        return await q.answer("⚠️ العملية غير موجودة.")
+
+    client = _client()
+    res = client.withdraw(
+        coin="USDT",
+        to_address=tx["address"],
+        amount=float(tx["usdt_amount"]),
+        network=tx["chain"]
     )
 
+    if res.get("code") == 0 and res.get("data"):
+        txid = res["data"].get("id") or res["data"].get("withdraw_id") or res["data"]
+        store.update_transaction_status("coinex_withdrawals", wid, "approved", txid=txid)
+        store.add_audit_log("coinex_withdrawals", wid, "approved", f"Executed via API, txid={txid}")
 
-# ======================== تنفيذ السحب بعد الموافقة ========================
-async def execute_withdraw(address: str, chain: str, amount: float):
-    """تنفيذ عملية السحب الفعلية بعد موافقة الأدمن"""
-    url = f"{COINEX_BASE_URL}/account/withdraw"
-    payload = {
-        "access_id": API_KEY,
-        "tonce": int(time.time() * 1000),
-        "coin_type": "USDT",
-        "smart_contract_name": chain,
-        "coin_address": address,
-        "actual_amount": str(amount),
-    }
-    payload["signature"] = generate_signature(payload, SECRET_KEY)
+        tg = store.get_user_telegram_by_id(tx["user_id"])
+        if tg:
+            await context.bot.send_message(tg, f"✅ تمت معالجة سحبك #{wid}.\n🆔 TxID: `{txid}`", parse_mode="Markdown")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload) as resp:
-            result = await resp.json()
-            return result
+        await q.edit_message_text(f"✅ تم تنفيذ السحب آليًا.\nTxID: `{txid}`", parse_mode="Markdown")
+    else:
+        store.update_transaction_status("coinex_withdrawals", wid, "error")
+        store.add_audit_log("coinex_withdrawals", wid, "error", f"API error: {res}")
+        await q.edit_message_text(f"❌ فشل تنفيذ السحب عبر CoinEx API.\nResponse: {res}")
+
+
+async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if int(q.from_user.id) not in ADMIN_IDS:
+        return await q.answer("❌ غير مصرح.")
+    wid = int(q.data.split(":")[1])
+    context.user_data["reject_wid"] = wid
+    await q.edit_message_text("✏️ الرجاء إدخال سبب الرفض:")
+    return "WAIT_REASON"
+
+
+async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reason = update.message.text.strip()
+    wid = context.user_data.pop("reject_wid", None)
+    if not wid:
+        return await update.message.reply_text("⚠️ لا يوجد طلب معلق.")
+    store.update_transaction_status("coinex_withdrawals", wid, "rejected", reason=reason)
+    store.add_audit_log("coinex_withdrawals", wid, "rejected", f"Admin rejected: {reason}")
+
+    tx = store.get_transaction("coinex_withdrawals", wid)
+    tg = store.get_user_telegram_by_id(tx["user_id"])
+    if tg:
+        await context.bot.send_message(tg, f"🚫 تم رفض عملية السحب #{wid}.\n📝 السبب: {reason}")
+    await update.message.reply_text(f"✅ تم رفض الطلب #{wid}.")
+    return ConversationHandler.END
+
+
+# ========== REGISTER ==========
+
+def register_handlers(dp):
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_withdraw, pattern="^coinex_withdraw$")],
+        states={
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_chain)],
+            CHAIN: [CallbackQueryHandler(ask_address, pattern="^chain_")],
+            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_request)],
+            CONFIRM: [CallbackQueryHandler(submit_request, pattern="^withdraw_")],
+            "WAIT_REASON": [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reject_reason)]
+        },
+        fallbacks=[]
+    )
+    dp.add_handler(conv)
+    dp.add_handler(CallbackQueryHandler(admin_approve, pattern="^admin_coinex_approve"))
+    dp.add_handler(CallbackQueryHandler(admin_reject, pattern="^admin_coinex_reject"))
