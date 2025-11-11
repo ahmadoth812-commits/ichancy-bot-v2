@@ -16,3 +16,10 @@ logs/
 
 # Playwright cache
 ms-playwright/
+
+#Ferent key
+fernet.key
+
+#Database-related files
+*.sqlite
+*.sqlite3
