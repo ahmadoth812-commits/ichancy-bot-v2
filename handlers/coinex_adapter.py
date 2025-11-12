@@ -1,138 +1,140 @@
-
-import time, hmac, hashlib, json, requests # Added requests import
+import time, hmac, hashlib, json, requests
 from urllib.parse import urlencode
-import config # Import config for API keys
+import config
 
-COINEX_BASE = "https://api.coinex.com"  # Base URL for CoinEx API
+COINEX_BASE = "https://api.coinex.com"  # v2 endpoints are under /v2/
 
 def timestamp_ms():
-    return int(time.time() * 1000)
+    """Return current timestamp in milliseconds as string."""
+    return str(int(time.time() * 1000))
 
-def sign_payload(secret: str, params: dict) -> str:
+
+def sign_payload(secret: str, method: str, request_path: str, query_string: str, body_str: str, timestamp: str) -> str:
     """
-    Generate HMAC-SHA256 signature for CoinEx API.
-    NOTE: CoinEx signature scheme can be complex. Verify with their latest API documentation.
-    Example: Concatenate sorted params, then HMAC-SHA256 with secret.
+    Build signature according to CoinEx v2 rules:
+    prepared_str = METHOD + request_path(+ '?' + query_string if exists) + body(optional) + timestamp
+    sign = HMAC_SHA256(secret, prepared_str).hexdigest().lower()
     """
-    sorted_params = sorted(params.items())
-    query_string = urlencode(sorted_params)
-    mac = hmac.new(secret.encode(), query_string.encode(), hashlib.sha256)
-    return mac.hexdigest()
+    path = request_path
+    if query_string:
+        path = f"{request_path}?{query_string}"
+    prepared = f"{method.upper()}{path}{body_str}{timestamp}"
+    mac = hmac.new(secret.encode('utf-8'), prepared.encode('utf-8'), hashlib.sha256)
+    return mac.hexdigest().lower()
+
 
 class CoinExClient:
-    def __init__(self, api_key: str, api_secret: str, access_id: str = None):
-        self.key = api_key
-        self.secret = api_secret
-        self.access_id = access_id # CoinEx usually uses Access ID as part of key
+    def __init__(self, access_id: str, secret_key: str):
+        """
+        access_id = API Key (aka Access ID)
+        secret_key = API Secret
+        """
+        self.access_id = access_id
+        self.secret_key = secret_key
 
-    def _headers(self, sign: str):
-        # NOTE: Verify CoinEx expects these specific headers for authentication
+    def _headers(self, sign: str, ts: str):
+        """Return headers required by CoinEx authentication"""
         return {
             "Content-Type": "application/json",
-            "X-ACCESS-KEY": self.key,
-            "X-ACCESS-SIGN": sign,
-            "X-ACCESS-TIMESTAMP": str(timestamp_ms()),
+            "X-COINEX-KEY": self.access_id,
+            "X-COINEX-SIGN": sign,
+            "X-COINEX-TIMESTAMP": ts,
         }
 
     def _request(self, method: str, path: str, params: dict = None, data: dict = None):
-        url = COINEX_BASE + path
+        """
+        Generic HTTP request to CoinEx API v2
+        Handles signing, timestamp, and error catching.
+        """
+        method = method.upper()
         params = params or {}
         data = data or {}
 
-        # Add common params, if required by CoinEx for signing (e.g., timestamp, access_id)
-        # Assuming timestamp is part of the signed payload, not just header for some endpoints
-        # params["access_id"] = self.access_id # If access_id needed in payload for signing
+        # API requires the request_path (including /v2 prefix) inside signature string
+        request_path = f"/v2{path}"
+        query_string = urlencode(params) if method == "GET" and params else ""
+        body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False) if method == "POST" else ""
 
-        sign = sign_payload(self.secret, params if method == "GET" else {**params, **data}) # Adjust signing for GET vs POST
-        headers = self._headers(sign)
+        ts = timestamp_ms()
+        sign = sign_payload(self.secret_key, method, request_path, query_string, body_str, ts)
+        headers = self._headers(sign, ts)
+        url = COINEX_BASE + request_path
 
         try:
             if method == "GET":
                 resp = requests.get(url, params=params, headers=headers, timeout=15)
             elif method == "POST":
-                resp = requests.post(url, json=data, headers=headers, timeout=15) # POST body uses 'data'
+                resp = requests.post(url, json=data, headers=headers, timeout=15)
             else:
                 raise ValueError("Unsupported HTTP method")
 
-            resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {e.response.status_code} - {e.response.text}")
             return {"error": "http-error", "status_code": e.response.status_code, "text": e.response.text}
         except requests.exceptions.RequestException as e:
-            print(f"Request Error: {e}")
             return {"error": "request-failed", "error_desc": str(e)}
-        except json.JSONDecodeError:
-            print(f"JSON Decode Error: Non-JSON response - {resp.text}")
-            return {"error": "non-json-response", "status_code": resp.status_code, "text": resp.text}
         except Exception as e:
-            print(f"Unexpected Error: {e}")
             return {"error": "unexpected-error", "error_desc": str(e)}
+
+    # =========================
+    #   Public API functions
+    # =========================
 
     def get_deposit_address(self, coin: str, chain: str = None):
         """
-        Get deposit address for a specific coin and chain.
-        NOTE: CoinEx API for this might be a GET request and different path.
-        Example (hypothetical GET path): /api/v2/spot/deposit-address
+        GET /v2/assets/deposit-address
+        Params: ccy=<coin>, chain=<optional>
         """
-        path = "/v2/account/deposit_address" # This is likely a POST with params in body for /v2
-        params = {"coin": coin}
-        if chain:
-            params["chain"] = chain # Assuming chain is passed in body
-
-        # For /v2/account/deposit_address, it usually expects POST with params in JSON body.
-        # The sign_payload should be adapted if CoinEx expects signing based on different parts.
-        return self._request("POST", path, data=params) # Use 'data' for JSON body
-
-    def get_deposit_history(self, coin: str, chain: str = None, limit: int = 10, offset: int = 0):
-        """
-        Get deposit history for a coin.
-        NOTE: This endpoint likely requires GET and a different path.
-        Example (hypothetical GET path): /api/v2/spot/deposit-history
-        """
-        path = "/v2/account/deposit_history" # Hypothetical path, verify with CoinEx docs
-        params = {"coin": coin, "limit": limit, "offset": offset}
+        path = "/assets/deposit-address"
+        params = {"ccy": coin}
         if chain:
             params["chain"] = chain
-        
-        # This is typically a GET request.
         return self._request("GET", path, params=params)
 
-    def withdraw(self, coin: str, to_address: str, amount: float, chain: str = None, memo: str = None):
+    def get_deposit_history(self, coin: str, chain: str = None, limit: int = 10, page: int = 1):
         """
-        Call withdraw endpoint.
-        NOTE: address whitelisting, correct signature, and 2FA are critical.
+        GET /v2/assets/deposit-history
+        Params: ccy, chain(optional), page, limit
         """
-        path = "/v2/account/withdraw" # Hypothetical path, verify with CoinEx docs
-        params = {
-            "coin": coin,
-            "address": to_address,
-            "amount": str(amount), # amount might need to be string
-            # "client_id": "unique_id_for_this_withdrawal" # Some exchanges require this
-        }
+        path = "/assets/deposit-history"
+        params = {"ccy": coin, "limit": limit, "page": page}
         if chain:
             params["chain"] = chain
+        return self._request("GET", path, params=params)
+
+    def withdraw(self, coin: str, to_address: str, amount: float, chain: str = None, memo: str = None, extra: dict = None):
+        """
+        POST /v2/assets/withdraw
+        Body: ccy, to_address, amount, chain(optional), memo(optional)
+        """
+        path = "/assets/withdraw"
+        data = {"ccy": coin, "to_address": to_address, "amount": str(amount)}
+        if chain:
+            data["chain"] = chain
         if memo:
-            params["memo"] = memo
+            data["memo"] = memo
+        if extra:
+            data["extra"] = extra
+        return self._request("POST", path, data=data)
 
-        return self._request("POST", path, data=params) # Use 'data' for JSON body
 
-# Global client instance (initially None, set when API keys are available)
+# Global client instance
 _coinex_client = None
 
 def get_coinex_client():
     global _coinex_client
     if _coinex_client is None:
-        if not config.COINEX_API_KEY or not config.COINEX_API_SECRET:
-            raise ValueError("CoinEx API Key or Secret not configured in config.py")
+        if not config.COINEX_ACCESS_ID or not config.COINEX_SECRET_KEY:
+            raise ValueError("CoinEx credentials not set in config.py")
         _coinex_client = CoinExClient(
-            api_key=config.COINEX_API_KEY,
-            api_secret=config.COINEX_API_SECRET,
-            access_id=config.COINEX_ACCESS_ID # Pass access_id if used
+            access_id=config.COINEX_ACCESS_ID,
+            secret_key=config.COINEX_SECRET_KEY
         )
     return _coinex_client
 
-# Simple wrapper functions for convenience
+
+# Async wrappers for integration with async Telegram handlers
 async def get_deposit_address(coin: str, chain: str):
     client = get_coinex_client()
     return client.get_deposit_address(coin, chain)
