@@ -1,0 +1,190 @@
+# main.py
+import logging
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import config
+
+# استيراد ال handlers
+from handlers.shamcash_deposit import register_handlers as register_shamcash_deposit
+from handlers.syriatelcash_deposit import register_handlers as register_syriatel_deposit
+from handlers.coinex_deposit import register_handlers as register_coinex_deposit
+from handlers.shamcash_withdraw import register_handlers as register_shamcash_withdraw
+from handlers.syriatelcash_withdraw import register_handlers as register_syriatel_withdraw
+from handlers.coinex_withdraw import register_handlers as register_coinex_withdraw
+from handlers.admin_transactions import register_handlers as register_admin_handlers
+from handlers.address_management import register_handlers as register_address_handlers
+from utils.notifications import set_bot_instance
+
+# إعداد التسجيل
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+async def start(update: Update, context):
+    """دالة البداية عندما يبدأ المستخدم"""
+    user = update.effective_user
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 رصيدي", callback_data="show_balance"),
+         InlineKeyboardButton("📥 إيداع", callback_data="deposit_options")],
+        [InlineKeyboardButton("📤 سحب", callback_data="withdraw_options"),
+         InlineKeyboardButton("🏦 عناويني", callback_data="manage_whitelist_addresses")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="show_stats"),
+         InlineKeyboardButton("🆘 المساعدة", callback_data="show_help")]
+    ]
+    
+    if update.message:
+        await update.message.reply_text(
+            f"مرحباً {user.first_name}! 👋\n\n"
+            "اختر الخدمة التي تريدها:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            f"مرحباً {user.first_name}! 👋\n\n"
+            "اختر الخدمة التي تريدها:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def deposit_options(update: Update, context):
+    """خيارات الإيداع"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🏦 Syriatel Cash", callback_data="syriatel_deposit")],
+        [InlineKeyboardButton("💳 ShamCash", callback_data="shamcash_deposit")],
+        [InlineKeyboardButton("🌐 CoinEx", callback_data="coinex_deposit")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        "📥 اختر طريقة الإيداع:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def withdraw_options(update: Update, context):
+    """خيارات السحب"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🏦 Syriatel Cash", callback_data="syriatel_withdraw")],
+        [InlineKeyboardButton("💳 ShamCash", callback_data="shamcash_withdraw")],
+        [InlineKeyboardButton("🌐 CoinEx", callback_data="coinex_withdraw")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        "📤 اختر طريقة السحب:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_balance(update: Update, context):
+    """عرض رصيد المستخدم"""
+    import store
+    query = update.callback_query
+    await query.answer()
+    
+    user = store.get_user_by_telegram_id(str(query.from_user.id))
+    if user:
+        balance = store.get_user_balance(user["id"])
+        await query.edit_message_text(
+            f"💰 رصيدك الحالي: {balance:,} NSP",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+            ])
+        )
+    else:
+        await query.edit_message_text(
+            "⚠️ حسابك غير مسجل. استخدم /start أولاً.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+            ])
+        )
+
+async def back_to_main(update: Update, context):
+    """العودة للقائمة الرئيسية"""
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
+
+async def show_help(update: Update, context):
+    """عرض المساعدة"""
+    query = update.callback_query
+    await query.answer()
+    
+    help_text = (
+        "🆘 مركز المساعدة\n\n"
+        "📥 الإيداع:\n"
+        "- Syriatel Cash: تحويل إلى أرقام Syriatel\n"
+        "- ShamCash: تحويل USD أو NSP\n"
+        "- CoinEx: إيداع USDT\n\n"
+        "📤 السحب:\n"
+        "- Syriatel Cash: سحب إلى أرقام Syriatel\n"
+        "- ShamCash: سحب إلى محفظة ShamCash\n"
+        "- CoinEx: سحب USDT إلى محفظتك\n\n"
+        "🏦 العناوين الموثوقة:\n"
+        "- أضف عناوينك الآمنة للسحب السريع"
+    )
+    
+    await query.edit_message_text(
+        help_text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+        ])
+    )
+
+async def show_stats(update: Update, context):
+    """عرض إحصائيات المستخدم"""
+    query = update.callback_query
+    await query.answer()
+    
+    # هنا يمكنك إضافة منطق جلب الإحصائيات
+    await query.edit_message_text(
+        "📊 الإحصائيات قريباً...",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+        ])
+    )
+
+def main():
+    """الدالة الرئيسية لتشغيل البوت"""
+    # إنشاء التطبيق
+    application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    
+    # حفظ نسخة البوت للإشعارات
+    set_bot_instance(application.bot)
+    
+    # إضافة handlers الأساسية
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", show_help))
+    
+    # إضافة handlers الاستعلامات
+    application.add_handler(CallbackQueryHandler(start, pattern="^back_to_main$"))
+    application.add_handler(CallbackQueryHandler(deposit_options, pattern="^deposit_options$"))
+    application.add_handler(CallbackQueryHandler(withdraw_options, pattern="^withdraw_options$"))
+    application.add_handler(CallbackQueryHandler(show_balance, pattern="^show_balance$"))
+    application.add_handler(CallbackQueryHandler(show_stats, pattern="^show_stats$"))
+    application.add_handler(CallbackQueryHandler(show_help, pattern="^show_help$"))
+    
+    # تسجيل جميع ال handlers المتخصصة
+    register_shamcash_deposit(application)
+    register_syriatel_deposit(application)
+    register_coinex_deposit(application)
+    register_shamcash_withdraw(application)
+    register_syriatel_withdraw(application)
+    register_coinex_withdraw(application)
+    register_admin_handlers(application)
+    register_address_handlers(application)
+    
+    # بدء البوت
+    print("🤖 البوت يعمل الآن...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()

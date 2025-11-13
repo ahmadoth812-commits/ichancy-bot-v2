@@ -87,15 +87,28 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
     context.user_data["address"] = address
     amount_nsp = context.user_data["amount_nsp"]
+    chain = context.user_data["chain"]
 
-    if not store.is_coinex_address_whitelisted(address):
-        await update.message.reply_text(
-            "⚠️ هذا العنوان غير مسجل في قائمة العناوين الموثوقة.\n"
-            "يرجى التواصل مع الإدارة لإضافته قبل طلب السحب."
-        )
+    user_telegram_id = str(update.effective_user.id)
+    user = store.get_user_by_telegram_id(user_telegram_id)
+    if not user:
+        await update.message.reply_text("⚠️ حسابك غير مسجل.")
         context.user_data.clear()
         return ConversationHandler.END
 
+    # ✅ التحقق من العنوان في القائمة البيضاء
+    if not store.is_coinex_address_whitelisted(user["id"], address, chain):
+        await update.message.reply_text(
+            f"⚠️ هذا العنوان غير موجود في قائمتك الموثوقة لشبكة {chain}.\n\n"
+            "يرجى إضافة العنوان إلى قائمتك الموثوقة أولاً:\n",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏦 إدارة العناوين الموثوقة", callback_data="manage_whitelist_addresses")],
+                [InlineKeyboardButton("🔙 إلغاء العملية", callback_data="cancel_action")]
+            ])
+        )
+        return ConversationHandler.END
+
+    # إذا كان العنوان موثوقاً، تابع العملية
     rate = store.get_usd_to_nsp_rate()
     if not rate or rate <= 0:
         await update.message.reply_text("⚠️ سعر التحويل غير متوفر حالياً. يرجى المحاولة لاحقاً.")
@@ -103,7 +116,6 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     usdt_amount = float("{:.6f}".format(amount_nsp / rate))
-    chain = context.user_data["chain"]
 
     summary = (
         f"📋 **ملخص طلب السحب:**\n\n"

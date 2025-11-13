@@ -18,9 +18,6 @@ def getDatabaseConnection():
         database=config.DB_NAME
     )
 
-# ==========================
-# دالة تنفيذ عامة للاستعلامات
-# ==========================
 def _execute_query(sql, params=None, fetch=False, fetchone=False):
     conn = getDatabaseConnection()
     cursor = conn.cursor(dictionary=True)
@@ -46,36 +43,29 @@ def _execute_query(sql, params=None, fetch=False, fetchone=False):
 # دوال المستخدمين
 # ==========================
 def get_user_by_id(user_id):
-    """Retrieve user by internal user ID."""
     return _execute_query("SELECT * FROM users WHERE id = %s", (user_id,), fetchone=True)
 
 def get_user_by_telegram_id(telegram_id):
-    """Retrieve user by Telegram ID."""
     return _execute_query("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,), fetchone=True)
 
 def get_user_telegram_by_id(user_id):
-    """Retrieve Telegram ID for a given internal user ID."""
     result = _execute_query("SELECT telegram_id FROM users WHERE id = %s", (user_id,), fetchone=True)
     return result["telegram_id"] if result else None
 
 def get_user_balance(user_id):
-    """Get current balance for a user."""
     result = _execute_query("SELECT balance FROM users WHERE id = %s", (user_id,), fetchone=True)
     return result["balance"] if result else 0
 
 def add_balance(user_id, amount):
-    """Add amount to user's balance."""
     _execute_query("UPDATE users SET balance = balance + %s WHERE id = %s", (amount, user_id))
 
 def deduct_balance(user_id, amount):
-    """Deduct amount from user's balance."""
     _execute_query("UPDATE users SET balance = balance - %s WHERE id = %s", (amount, user_id))
 
 # ==========================
 # دوال المعاملات
 # ==========================
 def get_transaction(table_name, tx_id):
-    """Get a transaction by its ID from a specific table."""
     valid_tables = [
         "syriatel_transactions", "shamcash_transactions",
         "coinex_transactions", "coinex_withdrawals",
@@ -86,16 +76,7 @@ def get_transaction(table_name, tx_id):
         return None
     return _execute_query(f"SELECT * FROM {table_name} WHERE id = %s", (tx_id,), fetchone=True)
 
-def update_transaction_status(
-    table_name,
-    tx_id,
-    status,
-    reason=None,
-    txid_external=None,
-    approved_at=None,
-    rejected_at=None
-):
-    """Update transaction status and optional details."""
+def update_transaction_status(table_name, tx_id, status, reason=None, txid_external=None, approved_at=None, rejected_at=None):
     valid_tables = [
         "syriatel_transactions", "shamcash_transactions",
         "coinex_transactions", "coinex_withdrawals",
@@ -111,18 +92,15 @@ def update_transaction_status(
     if reason is not None:
         sql_parts.append("reason = %s")
         params.append(reason)
-
     if txid_external is not None:
         txid_column = "txid"
         if table_name == "coinex_withdrawals":
             txid_column = "coinex_txid"
         sql_parts.append(f"{txid_column} = %s")
         params.append(txid_external)
-
     if approved_at is not None:
         sql_parts.append("approved_at = %s")
         params.append(approved_at)
-
     if rejected_at is not None:
         sql_parts.append("rejected_at = %s")
         params.append(rejected_at)
@@ -132,24 +110,21 @@ def update_transaction_status(
     _execute_query(sql, params)
 
 def add_audit_log(source, tx_id, action, actor="system", reason=None):
-    """Add an entry to the audit log."""
     _execute_query(
         "INSERT INTO audit_log (source, tx_id, action, actor, reason, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
         (source, tx_id, action, actor, reason, datetime.now())
     )
 
 # ==========================
-# إعدادات ديناميكية (Settings)
+# إعدادات ديناميكية
 # ==========================
 def get_usd_to_nsp_rate():
-    """Get the current USD to NSP conversion rate from DB."""
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("usd_to_nsp_rate",), fetchone=True)
     if result and result["value"].isdigit():
         return int(result["value"])
-    return 5000  # fallback value if not found
+    return 5000
 
 def update_usd_to_nsp_rate(new_rate):
-    """Update the USD to NSP conversion rate."""
     _execute_query(
         "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
         (str(new_rate), "usd_to_nsp_rate")
@@ -157,14 +132,12 @@ def update_usd_to_nsp_rate(new_rate):
     add_audit_log("system", 0, "update_rate", "admin", f"New rate set to {new_rate}")
 
 def get_syriatel_numbers():
-    """Get a list of Syriatel deposit numbers from DB."""
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("syriatel_numbers",), fetchone=True)
     if result and result["value"]:
         return [num.strip() for num in result["value"].split(',')]
-    return ["099xxxxxxxx", "098xxxxxxxx"]  # fallback default
+    return ["099xxxxxxxx", "098xxxxxxxx"]
 
 def update_syriatel_numbers(numbers_list):
-    """Update Syriatel deposit numbers (comma separated)."""
     numbers_str = ",".join(numbers_list)
     _execute_query(
         "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
@@ -173,14 +146,12 @@ def update_syriatel_numbers(numbers_list):
     add_audit_log("system", 0, "update_numbers", "admin", f"Updated Syriatel numbers to {numbers_str}")
 
 def get_shamcash_wallet():
-    """Get current ShamCash wallet address from DB."""
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("shamcash_wallet",), fetchone=True)
     if result and result["value"]:
         return result["value"]
     return "Not Configured"
 
 def update_shamcash_wallet(new_wallet):
-    """Update ShamCash wallet address."""
     _execute_query(
         "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
         (new_wallet, "shamcash_wallet")
@@ -188,15 +159,44 @@ def update_shamcash_wallet(new_wallet):
     add_audit_log("system", 0, "update_wallet", "admin", f"Updated ShamCash wallet to {new_wallet}")
 
 # ==========================
+# إدارة العناوين الموثوقة - ✅ الجديد والمصحح
+# ==========================
+def add_whitelisted_address(user_id, address, chain, label=None):
+    return _execute_query(
+        "INSERT INTO coinex_whitelisted_addresses (user_id, address, chain, label) VALUES (%s, %s, %s, %s)",
+        (user_id, address, chain, label)
+    )
+
+def get_whitelisted_addresses(user_id, chain=None):
+    if chain:
+        return _execute_query(
+            "SELECT * FROM coinex_whitelisted_addresses WHERE user_id = %s AND chain = %s AND is_active = TRUE",
+            (user_id, chain), fetch=True
+        )
+    else:
+        return _execute_query(
+            "SELECT * FROM coinex_whitelisted_addresses WHERE user_id = %s AND is_active = TRUE",
+            (user_id,), fetch=True
+        )
+
+def is_coinex_address_whitelisted(user_id, address, chain):
+    """✅ الدالة المصححة - تتحقق من العنوان للمستخدم المحدد"""
+    result = _execute_query(
+        "SELECT id FROM coinex_whitelisted_addresses WHERE user_id = %s AND address = %s AND chain = %s AND is_active = TRUE",
+        (user_id, address, chain), fetchone=True
+    )
+    return result is not None
+
+def remove_whitelisted_address(address_id):
+    return _execute_query(
+        "UPDATE coinex_whitelisted_addresses SET is_active = FALSE WHERE id = %s",
+        (address_id,)
+    )
+
+# ==========================
 # دوال إضافية
 # ==========================
-def is_coinex_address_whitelisted(address):
-    """Check if a CoinEx withdrawal address is whitelisted."""
-    logger.info(f"Checking if address {address} is whitelisted (currently True for demo)")
-    return True
-
 def get_user_telegram_by_tx(table_name, tx_id):
-    """Get Telegram ID of user associated with a transaction."""
     if table_name not in ["shamcash_withdrawals", "syriatel_withdrawals"]:
         return None
     tx = get_transaction(table_name, tx_id)
@@ -206,7 +206,6 @@ def get_user_telegram_by_tx(table_name, tx_id):
     return None
 
 def finalize_shamcash_withdraw(tx_id, external_txid):
-    """Finalize ShamCash withdrawal with external transaction ID."""
     _execute_query(
         "UPDATE shamcash_withdrawals SET status = %s, txid = %s, approved_at = %s WHERE id = %s",
         ("approved", external_txid, datetime.now(), tx_id)
