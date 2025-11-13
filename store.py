@@ -113,7 +113,6 @@ def update_transaction_status(
         params.append(reason)
 
     if txid_external is not None:
-        # توحيد اسم العمود لجميع الأنواع
         txid_column = "txid"
         if table_name == "coinex_withdrawals":
             txid_column = "coinex_txid"
@@ -140,24 +139,59 @@ def add_audit_log(source, tx_id, action, actor="system", reason=None):
     )
 
 # ==========================
-# معدلات التحويل
+# إعدادات ديناميكية (Settings)
 # ==========================
 def get_usd_to_nsp_rate():
-    """Get the current USD to NSP conversion rate."""
-    # يمكن لاحقًا سحبها من قاعدة بيانات أو لوحة تحكم
-    return 5000  # معدل افتراضي
+    """Get the current USD to NSP conversion rate from DB."""
+    result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("usd_to_nsp_rate",), fetchone=True)
+    if result and result["value"].isdigit():
+        return int(result["value"])
+    return 5000  # fallback value if not found
 
-# ==========================
-# دوال أخرى
-# ==========================
+def update_usd_to_nsp_rate(new_rate):
+    """Update the USD to NSP conversion rate."""
+    _execute_query(
+        "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
+        (str(new_rate), "usd_to_nsp_rate")
+    )
+    add_audit_log("system", 0, "update_rate", "admin", f"New rate set to {new_rate}")
+
 def get_syriatel_numbers():
-    """Get a list of Syriatel deposit numbers."""
-    # مستقبلاً يمكن حفظها بجدول syriatel_numbers
-    return ["099xxxxxxxx", "098xxxxxxxx"]
+    """Get a list of Syriatel deposit numbers from DB."""
+    result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("syriatel_numbers",), fetchone=True)
+    if result and result["value"]:
+        return [num.strip() for num in result["value"].split(',')]
+    return ["099xxxxxxxx", "098xxxxxxxx"]  # fallback default
 
+def update_syriatel_numbers(numbers_list):
+    """Update Syriatel deposit numbers (comma separated)."""
+    numbers_str = ",".join(numbers_list)
+    _execute_query(
+        "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
+        (numbers_str, "syriatel_numbers")
+    )
+    add_audit_log("system", 0, "update_numbers", "admin", f"Updated Syriatel numbers to {numbers_str}")
+
+def get_shamcash_wallet():
+    """Get current ShamCash wallet address from DB."""
+    result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("shamcash_wallet",), fetchone=True)
+    if result and result["value"]:
+        return result["value"]
+    return "Not Configured"
+
+def update_shamcash_wallet(new_wallet):
+    """Update ShamCash wallet address."""
+    _execute_query(
+        "UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s",
+        (new_wallet, "shamcash_wallet")
+    )
+    add_audit_log("system", 0, "update_wallet", "admin", f"Updated ShamCash wallet to {new_wallet}")
+
+# ==========================
+# دوال إضافية
+# ==========================
 def is_coinex_address_whitelisted(address):
     """Check if a CoinEx withdrawal address is whitelisted."""
-    # لاحقًا تحقق من جدول فعلي
     logger.info(f"Checking if address {address} is whitelisted (currently True for demo)")
     return True
 

@@ -7,16 +7,17 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
-    CommandHandler, # Added CommandHandler for /cancel
+    CommandHandler,
 )
 import store
 import config
-from utils.notifications import notify_user, notify_admin # For notifications
+from utils.notifications import notify_user, notify_admin
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-CURRENCY, AMOUNT, TXID, ADMIN_REJECT_REASON = range(4) # Added ADMIN_REJECT_REASON state
+CURRENCY, AMOUNT, TXID, ADMIN_REJECT_REASON = range(4)
+
 
 # =============================
 # 💰 بدء عملية الإيداع
@@ -24,6 +25,7 @@ CURRENCY, AMOUNT, TXID, ADMIN_REJECT_REASON = range(4) # Added ADMIN_REJECT_REAS
 async def start_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     text = "💵 اختر نوع العملة التي قمت بالتحويل بها:"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🇺🇸 USD", callback_data="shamcash_usd"),
@@ -35,16 +37,30 @@ async def start_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================
-# 💲 إدخال المبلغ
+# 💲 بعد اختيار العملة، عرض عنوان المحفظة + طلب المبلغ
 # =============================
 async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     context.user_data["currency"] = "USD" if "usd" in q.data else "NSP"
-    cur = context.user_data["currency"]
+    currency = context.user_data["currency"]
+
+    shamcash_wallet = store.get_shamcash_wallet()
+
+    # ✅ فحص أن العنوان مضبوط فعليًا
+    if shamcash_wallet in (None, "Not Configured", "", "غير محدد"):
+        await q.edit_message_text("⚠️ لم يتم ضبط عنوان محفظة ShamCash بعد. يرجى المحاولة لاحقًا.")
+        return ConversationHandler.END
+
+    text = (
+        f"📍 عنوان محفظة الإيداع:\n<code>{shamcash_wallet}</code>\n\n"
+        f"💰 الرجاء إدخال المبلغ الذي قمت بتحويله ({currency}):"
+    )
     await q.edit_message_text(
-        f"💰 الرجاء إدخال المبلغ الذي قمت بتحويله ({cur}):",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_action")]])
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_action")]]),
+        parse_mode="HTML"
     )
     return AMOUNT
 
@@ -88,8 +104,12 @@ async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Check for duplicate TXID
-    existing_tx = store._execute_query("SELECT id FROM shamcash_transactions WHERE txid = %s AND status != 'rejected'", (txid,), fetchone=True)
+    # 🔎 فحص تكرار المعاملة
+    existing_tx = store._execute_query(
+        "SELECT id FROM shamcash_transactions WHERE txid = %s AND status != 'rejected'",
+        (txid,),
+        fetchone=True
+    )
     if existing_tx:
         await update.message.reply_text("⚠️ لقد قمت بتقديم طلب إيداع بنفس معرف المعاملة هذا من قبل.")
         context.user_data.clear()
@@ -98,26 +118,35 @@ async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx_id = store._execute_query("""
         INSERT INTO shamcash_transactions (user_id, currency, amount, txid, status, created_at)
         VALUES (%s,%s,%s,%s,%s,%s)
-    """, (user["id"], currency, amount, txid, "pending", datetime.now()), fetchone=False) # Returns lastrowid
+    """, (user["id"], currency, amount, txid, "pending", datetime.now()), fetchone=False)
 
     if tx_id:
-        store.add_audit_log("shamcash_deposit", tx_id, "pending", actor=f"user_{user_telegram_id}", reason=f"User submitted deposit in {currency}")
+        store.add_audit_log(
+            "shamcash_deposit", tx_id, "pending",
+            actor=f"user_{user_telegram_id}",
+            reason=f"User submitted deposit in {currency}"
+        )
 
         await update.message.reply_text("✅ تم تسجيل طلب الإيداع بانتظار مراجعة الإدارة.")
         context.user_data.clear()
+
+        shamcash_wallet = store.get_shamcash_wallet() or "غير محدد"
 
         msg = (
             f"🔔 <b>طلب إيداع جديد عبر ShamCash</b>\n\n"
             f"👤 المستخدم: <a href='tg://user?id={user_telegram_id}'>@{update.effective_user.username or update.effective_user.full_name}</a>\n"
             f"💰 المبلغ: <code>{amount}</code> {currency}\n"
             f"🆔 TxID: <code>{txid}</code>\n"
+            f"🏦 المحفظة المستلمة: <code>{shamcash_wallet}</code>\n"
             f"رقم العملية: <code>{tx_id}</code>"
         )
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ موافقة", callback_data=f"admin_approve_shamcash_dep:{tx_id}")],
             [InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject_shamcash_dep:{tx_id}")]
         ])
         await notify_admin(msg, reply_markup=kb, parse_mode="HTML")
+
     else:
         await update.message.reply_text("❌ حدث خطأ في تسجيل الإيداع بقاعدة البيانات.")
         context.user_data.clear()
@@ -142,11 +171,11 @@ async def admin_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = tx["user_id"]
     value = tx["amount"]
 
-    # تحويل USD إلى NSP إن لزم
+    # 💱 تحويل USD إلى NSP إن لزم
     if tx["currency"] == "USD":
         rate = store.get_usd_to_nsp_rate()
         value = int(value * rate)
-        
+
     store.add_balance(user_id, value)
     store.update_transaction_status("shamcash_transactions", tx_id, "approved", approved_at=datetime.now())
     store.add_audit_log("shamcash_deposit", tx_id, "approved", actor=f"admin_{q.from_user.id}", reason="Admin approved deposit")
@@ -158,6 +187,7 @@ async def admin_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ تمت الموافقة على إيداعك #{tx_id} بمبلغ <b>{value} NSP</b>.",
             parse_mode="HTML"
         )
+
     await q.edit_message_text(f"✅ تمت الموافقة على العملية #{tx_id}.")
 
 
@@ -173,7 +203,7 @@ async def admin_reject_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx_id = int(q.data.split(":")[1])
     context.user_data["reject_tx_id"] = tx_id
     await q.message.reply_text("✏️ الرجاء إدخال سبب الرفض:")
-    return ADMIN_REJECT_REASON # Enter the conversation state
+    return ADMIN_REJECT_REASON
 
 
 async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +231,9 @@ async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# Cancellation handler
+# =============================
+# ❎ إلغاء العملية
+# =============================
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -224,12 +256,12 @@ def register_handlers(dp):
             TXID: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize)],
             ADMIN_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reject_reason)],
         },
-        fallbacks=[CallbackQueryHandler(cancel_action, pattern="^cancel_action$"),
-                   CommandHandler("cancel", cancel_action)],
+        fallbacks=[
+            CallbackQueryHandler(cancel_action, pattern="^cancel_action$"),
+            CommandHandler("cancel", cancel_action)
+        ],
     )
 
     dp.add_handler(conv)
     dp.add_handler(CallbackQueryHandler(admin_approve_dep, pattern="^admin_approve_shamcash_dep"))
     dp.add_handler(CallbackQueryHandler(admin_reject_dep, pattern="^admin_reject_shamcash_dep"))
-    # The MessageHandler for receive_reject_reason is now part of the ConversationHandler
-    # dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reject_reason)) # This is no longer needed globally
