@@ -16,9 +16,8 @@ DB_NAME = os.getenv("DB_NAME", "ichancy_bot")
 ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "YOUR_ADMIN_ID_HERE").split(',')]
 
 # CoinEx API Configuration
-COINEX_API_KEY = os.getenv("COINEX_API_KEY", "YOUR_COINEX_API_KEY")
-COINEX_API_SECRET = os.getenv("COINEX_API_SECRET", "YOUR_COINEX_API_SECRET")
-COINEX_ACCESS_ID = os.getenv("COINEX_ACCESS_ID", "") # Optional
+COINEX_ACCESS_ID = os.getenv("COINEX_ACCESS_ID", "your_access_id_here")
+COINEX_SECRET_KEY = os.getenv("COINEX_SECRET_KEY", "your_secret_key_here")
 
 # Withdrawal/Deposit Limits and Fees
 SHAMCASH_MIN_USD = int(os.getenv("SHAMCASH_MIN_USD", "5"))
