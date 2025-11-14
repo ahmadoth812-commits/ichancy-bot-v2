@@ -4,6 +4,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ContextTypes,
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import config
@@ -34,8 +35,9 @@ logger = logging.getLogger(__name__)
 # ==============================
 #       START FUNCTION
 # ==============================
-async def start(update: Update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_name = (getattr(user, "first_name", None) or getattr(user, "username", None) or "المستخدم")
 
     keyboard = [
         [
@@ -53,7 +55,7 @@ async def start(update: Update, context):
     ]
 
     text = (
-        f"مرحباً {user.first_name}! 👋\n\n"
+        f"مرحباً {user_name}! 👋\n\n"
         "اختر الخدمة التي تريدها:"
     )
 
@@ -68,7 +70,7 @@ async def start(update: Update, context):
 # ==============================
 #      DEPOSIT OPTIONS
 # ==============================
-async def deposit_options(update: Update, context):
+async def deposit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -88,7 +90,7 @@ async def deposit_options(update: Update, context):
 # ==============================
 #      WITHDRAW OPTIONS
 # ==============================
-async def withdraw_options(update: Update, context):
+async def withdraw_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -108,7 +110,7 @@ async def withdraw_options(update: Update, context):
 # ==============================
 #        SHOW BALANCE
 # ==============================
-async def show_balance(update: Update, context):
+async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import store
 
     query = update.callback_query
@@ -125,6 +127,13 @@ async def show_balance(update: Update, context):
 
     balance = store.get_user_balance(user["id"])
 
+    if balance is None:
+        await query.edit_message_text(
+            "⚠️ حدث خطأ أثناء جلب الرصيد. حاول لاحقًا.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
+        )
+        return
+
     await query.edit_message_text(
         f"💰 رصيدك الحالي: {balance:,} NSP",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
@@ -134,7 +143,7 @@ async def show_balance(update: Update, context):
 # ==============================
 #          HELP MENU
 # ==============================
-async def show_help(update: Update, context):
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -161,7 +170,7 @@ async def show_help(update: Update, context):
 # ==============================
 #         STATISTICS
 # ==============================
-async def show_stats(update: Update, context):
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -174,11 +183,10 @@ async def show_stats(update: Update, context):
 # ==============================
 #       BACK TO MAIN MENU
 # ==============================
-async def back_to_main(update: Update, context):
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await start(update, context)
-
 
 
 # ==============================
@@ -194,6 +202,10 @@ def main():
 
     # تمرير نسخة البوت لوحدة الاشعارات (مهم ليعمل notify_user/notify_admin)
     set_bot_instance(application.bot)
+
+    # تحذير إن كانت قائمة المشرفين فارغة لكي لا يفاجئك عدم وصول التنبيهات
+    if not getattr(config, "ADMIN_IDS", []):
+        logger.warning("ADMIN_IDS غير مهيأ — notify_admin لن يرسل رسائل لمشرفين. ضع ADMIN_IDS في .env إن أردت إشعارات للمشرفين.")
 
     # أوامر
     application.add_handler(CommandHandler("start", start))
