@@ -21,7 +21,8 @@ from handlers.coinex_withdraw import register_handlers as register_coinex_withdr
 
 from handlers.admin_transactions import register_handlers as register_admin_handlers
 from handlers.address_management import register_handlers as register_address_handlers
-from handlers.admin_setting_handler import register_handlers as register_admin_setting_handlers
+from handlers.admin_settings import register_handlers as register_admin_setting_handlers
+
 
 
 # إعداد التسجيل

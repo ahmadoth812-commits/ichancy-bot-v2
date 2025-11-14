@@ -1,3 +1,4 @@
+# handlers/coinex_deposit.py
 import logging
 from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -42,9 +43,15 @@ async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         addr_info = await get_deposit_address(coin="USDT", chain=chain)
-        addr = addr_info.get("data", {}).get("address")
+        addr = None
+        if isinstance(addr_info, dict):
+            # API shape may differ; try to find address in common places
+            addr = addr_info.get("data", {}).get("address") if addr_info.get("data") else None
+            if not addr:
+                # fallback keys
+                addr = addr_info.get("address") or (addr_info.get("data") and addr_info["data"][0].get("address") if isinstance(addr_info["data"], list) else None)
         if not addr:
-            raise ValueError(f"لا يوجد عنوان متاح. استجابة CoinEx: {addr_info}")
+            raise ValueError(f"No address returned from CoinEx: {addr_info}")
     except Exception as e:
         logger.error(f"CoinEx Address Error: {e}")
         await q.edit_message_text("⚠️ تعذر جلب عنوان الإيداع، حاول لاحقاً.")
@@ -80,22 +87,28 @@ async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         deposits_response = await get_deposit_history("USDT", chain=chain, limit=50)
-        if deposits_response.get("code") != 0 or not deposits_response.get("data"):
-            logger.warning(f"CoinEx deposit history API error: {deposits_response}")
+        if not isinstance(deposits_response, dict):
+            logger.warning(f"Unexpected deposit history response type: {deposits_response}")
             await q.edit_message_text("⚠️ تعذر جلب سجل الإيداعات، حاول لاحقاً.")
             return ConversationHandler.END
 
-        deposits = deposits_response["data"]
+        if deposits_response.get("code") not in (0, None) and not deposits_response.get("data"):
+            # Some APIs return code==0 on success. If not present, still try to read data.
+            logger.warning(f"CoinEx deposit history API warning: {deposits_response}")
+        deposits = deposits_response.get("data") or []
         found_deposit = None
 
         # البحث عن أول عملية جديدة تخص المستخدم وعنوانه
         for dep in deposits:
-            txid = dep.get("tx_id")
+            txid = dep.get("tx_id") or dep.get("txid") or dep.get("id")
             amount = float(dep.get("amount", 0))
-            status = dep.get("status")
-            to_addr = dep.get("to_address")
+            status = dep.get("status") or dep.get("state")
+            to_addr = dep.get("to_address") or dep.get("address") or dep.get("to")
 
             # تحقق من عدم تسجيل المعاملة مسبقًا
+            if not txid:
+                continue
+
             existing_tx = store._execute_query(
                 "SELECT id FROM coinex_transactions WHERE txid = %s", (txid,), fetchone=True
             )
@@ -103,7 +116,7 @@ async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # تحقق أن الإيداع مكتمل ووجهته هي عنوان المستخدم
-            if status == "FINISHED" and amount > 0 and to_addr == deposit_address:
+            if (str(status).upper() in ("FINISHED", "COMPLETED", "SUCCESS")) and amount > 0 and to_addr == deposit_address:
                 found_deposit = dep
                 break
 
@@ -111,8 +124,8 @@ async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("⌛ لا توجد إيداعات مكتملة جديدة مرتبطة بعنوانك بعد.")
             return ConversationHandler.END
 
-        txid = found_deposit["tx_id"]
-        amount = float(found_deposit["amount"])
+        txid = found_deposit.get("tx_id") or found_deposit.get("txid") or found_deposit.get("id")
+        amount = float(found_deposit.get("amount", 0))
     except Exception as e:
         logger.error(f"CoinEx Confirm Error: {e}")
         await q.edit_message_text("❌ حدث خطأ أثناء التحقق من العملية.")

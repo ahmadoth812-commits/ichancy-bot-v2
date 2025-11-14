@@ -1,3 +1,4 @@
+# handlers/coinex_withdraw.py
 import logging
 from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -10,7 +11,7 @@ from telegram.ext import (
     CommandHandler,
 )
 import store, config
-from services.coinex_adapter import get_coinex_client, withdraw_coinex  # ✅ استيراد الدالة الصحيحة
+from services.coinex_adapter import withdraw_coinex
 from utils.notifications import notify_user, notify_admin
 
 logger = logging.getLogger(__name__)
@@ -20,9 +21,6 @@ AMOUNT, CHAIN, ADDRESS, CONFIRM, REJECT_REASON = range(5)
 
 def _fmt_nsp(n):
     return f"{int(n):,} NSP"
-
-
-# ==================== USER FLOW ====================
 
 async def start_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -34,7 +32,6 @@ async def start_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_action")]])
     )
     return AMOUNT
-
 
 async def ask_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ask user to choose withdrawal chain (BEP20 / TRC20)"""
@@ -69,7 +66,6 @@ async def ask_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌐 اختر السلسلة المراد السحب عليها:", reply_markup=kb)
     return CHAIN
 
-
 async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -80,7 +76,6 @@ async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_action")]])
     )
     return ADDRESS
-
 
 async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User enters withdrawal address and confirms"""
@@ -96,7 +91,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    # ✅ التحقق من العنوان في القائمة البيضاء
+    # ✅ التحقق من العنوان في القائمة البيضاء (signature updated in store)
     if not store.is_coinex_address_whitelisted(user["id"], address, chain):
         await update.message.reply_text(
             f"⚠️ هذا العنوان غير موجود في قائمتك الموثوقة لشبكة {chain}.\n\n"
@@ -131,7 +126,6 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(summary, reply_markup=kb, parse_mode="Markdown")
     return CONFIRM
-
 
 async def submit_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User confirms and request is stored pending admin review"""
@@ -190,7 +184,6 @@ async def submit_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-
 # ==================== ADMIN FLOW ====================
 
 async def admin_approve_coinex_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,7 +200,6 @@ async def admin_approve_coinex_withdraw(update: Update, context: ContextTypes.DE
         return await q.answer("⚠️ العملية غير موجودة أو تمت معالجتها.")
 
     try:
-        # ✅ استدعاء الدالة الصحيحة
         res = await withdraw_coinex(
             coin="USDT",
             to_address=tx["address"],
@@ -215,7 +207,7 @@ async def admin_approve_coinex_withdraw(update: Update, context: ContextTypes.DE
             chain=tx["chain"]
         )
 
-        if res.get("code") == 0 and res.get("data"):
+        if isinstance(res, dict) and res.get("code") == 0 and res.get("data"):
             coinex_txid = (
                 res["data"].get("id")
                 or res["data"].get("withdraw_id")
@@ -261,7 +253,7 @@ async def admin_approve_coinex_withdraw(update: Update, context: ContextTypes.DE
                     f"❌ تم السحب بنجاح ولكن لم يتم استرجاع معرف العملية.\nالاستجابة: {res}"
                 )
         else:
-            error_msg = res.get("message") or res.get("error_desc") or str(res)
+            error_msg = (res.get("message") or res.get("error_desc") or str(res)) if isinstance(res, dict) else str(res)
             store.update_transaction_status(
                 "coinex_withdrawals",
                 wid,
@@ -277,7 +269,6 @@ async def admin_approve_coinex_withdraw(update: Update, context: ContextTypes.DE
         )
         await q.edit_message_text(f"❌ حدث خطأ داخلي أثناء محاولة تنفيذ السحب لـ #{wid}.")
 
-
 async def admin_reject_coinex_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -287,7 +278,6 @@ async def admin_reject_coinex_withdraw(update: Update, context: ContextTypes.DEF
     context.user_data["reject_wid"] = wid
     await q.message.reply_text("✏️ الرجاء إدخال سبب الرفض:")
     return REJECT_REASON
-
 
 async def receive_reject_reason_coinex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = update.message.text.strip()
@@ -316,16 +306,15 @@ async def receive_reject_reason_coinex(update: Update, context: ContextTypes.DEF
         user_telegram_id = store.get_user_telegram_by_id(tx["user_id"])
         if user_telegram_id:
             await notify_user(user_telegram_id, f"🚫 تم رفض عملية السحب #{wid}.\n📝 السبب: {reason}")
-        store.add_balance(tx["user_id"], tx["nsp_amount"])
-        await notify_user(user_telegram_id, f"✅ تم إعادة رصيد {tx['nsp_amount']:,} NSP إلى حسابك.")
+        # return balance
+        store.add_balance(tx["user_id"], tx.get("nsp_amount") or tx.get("nsp"))
+        await notify_user(user_telegram_id, f"✅ تم إعادة رصيد {tx.get('nsp_amount'):,} NSP إلى حسابك.")
 
     await update.message.reply_text(f"✅ تم رفض الطلب #{wid}.")
     context.user_data.clear()
     return ConversationHandler.END
 
-
-# ==================== CANCEL HANDLER ====================
-
+# Cancellation handler
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -334,9 +323,6 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❎ تم إلغاء العملية.")
     context.user_data.clear()
     return ConversationHandler.END
-
-
-# ==================== REGISTER ====================
 
 def register_handlers(dp):
     conv = ConversationHandler(

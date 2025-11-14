@@ -105,38 +105,58 @@ def add_audit_log(source, tx_id, action, actor="system", reason=None):
 # Rates & settings
 def get_usd_to_nsp_rate():
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("usd_to_nsp_rate",), fetchone=True)
-    if result and str(result.get("value","")).isdigit():
-        return int(result["value"])
+    if result and result.get("value") is not None:
+        try:
+            return int(float(result["value"]))
+        except Exception:
+            logger.warning("usd_to_nsp_rate in settings couldn't be parsed to int; returning fallback")
     return 5000
 
 def update_usd_to_nsp_rate(new_rate):
-    # upsert pattern: try update, if affected rows == 0 insert
-    _execute_query("UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s", (str(new_rate), "usd_to_nsp_rate"))
+    # use upsert to ensure setting exists
+    _execute_query(
+        "INSERT INTO settings (key_name, value, updated_at) VALUES (%s,%s,NOW()) "
+        "ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = NOW()",
+        ("usd_to_nsp_rate", str(new_rate))
+    )
     add_audit_log("system", 0, "update_rate", actor="admin", reason=f"New rate set to {new_rate}")
 
 def get_syriatel_numbers():
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("syriatel_numbers",), fetchone=True)
-    if result and result["value"]:
+    if result and result.get("value"):
         return [num.strip() for num in result["value"].split(',') if num.strip()]
     return ["099xxxxxxxx", "098xxxxxxxx"]
 
 def update_syriatel_numbers(numbers):
     val = ",".join(numbers)
-    _execute_query("UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s", (val, "syriatel_numbers"))
+    _execute_query(
+        "INSERT INTO settings (key_name, value, updated_at) VALUES (%s,%s,NOW()) "
+        "ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = NOW()",
+        ("syriatel_numbers", val)
+    )
     add_audit_log("system", 0, "update_syriatel_numbers", actor="admin", reason=f"New syriatel numbers: {val}")
 
 def get_shamcash_wallet():
     result = _execute_query("SELECT value FROM settings WHERE key_name = %s", ("shamcash_wallet",), fetchone=True)
-    if result and result["value"]:
+    if result and result.get("value"):
         return result["value"]
     return "Not Configured"
 
 def update_shamcash_wallet(addr):
-    _execute_query("UPDATE settings SET value = %s, updated_at = NOW() WHERE key_name = %s", (addr, "shamcash_wallet"))
+    _execute_query(
+        "INSERT INTO settings (key_name, value, updated_at) VALUES (%s,%s,NOW()) "
+        "ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = NOW()",
+        ("shamcash_wallet", addr)
+    )
     add_audit_log("system", 0, "update_shamcash_wallet", actor="admin", reason=f"New shamcash wallet: {addr}")
 
-def is_coinex_address_whitelisted(address):
-    logger.info(f"Checking if address {address} is whitelisted (currently True for demo)")
+def is_coinex_address_whitelisted(user_id, address, chain=None):
+    """
+    Placeholder: checks whether a withdrawal address is whitelisted for given user and chain.
+    Current implementation is permissive (returns True) — replace with a DB check:
+      SELECT 1 FROM coinex_whitelist WHERE user_id=%s AND address=%s AND chain=%s
+    """
+    logger.info(f"Checking if address {address} (chain={chain}) is whitelisted for user {user_id} — currently returns True for demo.")
     return True
 
 def get_user_telegram_by_tx(table_name, tx_id):
