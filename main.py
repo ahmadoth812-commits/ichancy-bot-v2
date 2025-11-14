@@ -4,8 +4,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import config
