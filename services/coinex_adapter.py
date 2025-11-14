@@ -1,114 +1,140 @@
+# services/coinex_adapter.py
 import time
 import hmac
 import hashlib
-import aiohttp
+import json
+import requests
 from urllib.parse import urlencode
 import config
+import asyncio
 
-COINEX_BASE = "https://api.coinex.com"
+COINEX_BASE = "https://api.coinex.com"  # v2 endpoints are under /v2/
 
-def sign_payload_v2(secret: str, method: str, path: str, params: dict = None):
-    params = params or {}
-    
-    timestamp = str(int(time.time()))
-    sorted_params = sorted(params.items())
-    query_string = urlencode(sorted_params)
-    
-    sign_text = f"{method}\n{path}\n{query_string}\n{timestamp}"
-    
-    signature = hmac.new(
-        secret.encode('utf-8'),
-        sign_text.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    
-    return signature, timestamp
+
+def timestamp_ms():
+    """Return current timestamp in milliseconds as string."""
+    return str(int(time.time() * 1000())) if False else str(int(time.time() * 1000))
+
+
+def sign_payload(secret: str, method: str, request_path: str, query_string: str, body_str: str, timestamp: str) -> str:
+    """
+    Build signature according to CoinEx v2 rules:
+    prepared_str = METHOD + request_path(+ '?' + query_string if exists) + body(optional) + timestamp
+    sign = HMAC_SHA256(secret, prepared_str).hexdigest().lower()
+    """
+    path = request_path
+    if query_string:
+        path = f"{request_path}?{query_string}"
+    prepared = f"{method.upper()}{path}{body_str}{timestamp}"
+    mac = hmac.new(secret.encode('utf-8'), prepared.encode('utf-8'), hashlib.sha256)
+    return mac.hexdigest().lower()
 
 
 class CoinExClient:
     def __init__(self, access_id: str, secret_key: str):
+        """
+        access_id = API Key (aka Access ID)
+        secret_key = API Secret
+        """
         self.access_id = access_id
         self.secret_key = secret_key
-        self._session = None
 
-    async def _get_session(self):
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    def _headers(self, signature: str, timestamp: str):
+    def _headers(self, sign: str, ts: str):
+        """Return headers required by CoinEx authentication"""
         return {
             "Content-Type": "application/json",
-            "X-COINEX-ACCESS-ID": self.access_id,
-            "X-COINEX-SIGN": signature,
-            "X-COINEX-TIMESTAMP": timestamp,
+            "X-COINEX-KEY": self.access_id,
+            "X-COINEX-SIGN": sign,
+            "X-COINEX-TIMESTAMP": ts,
         }
 
-    async def _request(self, method: str, path: str, params: dict = None):
+    def _request(self, method: str, path: str, params: dict = None, data: dict = None):
+        """
+        Generic HTTP request to CoinEx API v2
+        Handles signing, timestamp, and error catching.
+        """
+        method = method.upper()
         params = params or {}
-        signature, timestamp = sign_payload_v2(self.secret_key, method, path, params)
-        headers = self._headers(signature, timestamp)
-        url = COINEX_BASE + path
-        
-        session = await self._get_session()
+        data = data or {}
+
+        # API requires the request_path (including /v2 prefix) inside signature string
+        request_path = f"/v2{path}"
+        query_string = urlencode(params) if method == "GET" and params else ""
+        body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False) if method == "POST" else ""
+
+        ts = timestamp_ms()
+        sign = sign_payload(self.secret_key, method, request_path, query_string, body_str, ts)
+        headers = self._headers(sign, ts)
+        url = COINEX_BASE + request_path
+
         try:
             if method == "GET":
-                async with session.get(url, params=params, headers=headers, timeout=15) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
+                resp = requests.get(url, params=params, headers=headers, timeout=15)
             elif method == "POST":
-                async with session.post(url, json=params, headers=headers, timeout=15) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
+                resp = requests.post(url, json=data, headers=headers, timeout=15)
             else:
-                raise ValueError(f"Unsupported method: {method}")
-                
-        except aiohttp.ClientError as e:
-            return {"code": -1, "message": f"Request failed: {str(e)}"}
+                raise ValueError("Unsupported HTTP method")
+
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            return {"error": "http-error", "status_code": e.response.status_code, "text": e.response.text}
+        except requests.exceptions.RequestException as e:
+            return {"error": "request-failed", "error_desc": str(e)}
         except Exception as e:
-            return {"code": -1, "message": f"Unexpected error: {str(e)}"}
+            return {"error": "unexpected-error", "error_desc": str(e)}
 
-    async def get_deposit_address(self, coin: str, chain: str = None):
-        path = "/v2/account/deposit/address"
-        params = {"coin": coin}
+    # =========================
+    #   Public API functions
+    # =========================
+
+    def get_deposit_address(self, coin: str, chain: str = None):
+        """
+        GET /v2/assets/deposit-address
+        Params: ccy=<coin>, chain=<optional>
+        """
+        path = "/assets/deposit-address"
+        params = {"ccy": coin}
         if chain:
             params["chain"] = chain
-        return await self._request("GET", path, params)
+        return self._request("GET", path, params=params)
 
-    async def get_deposit_history(self, coin: str, chain: str = None, limit: int = 10):
-        path = "/v2/account/deposit/history"
-        params = {"coin": coin, "limit": limit}
+    def get_deposit_history(self, coin: str, chain: str = None, limit: int = 10, page: int = 1):
+        """
+        GET /v2/assets/deposit-history
+        Params: ccy, chain(optional), page, limit
+        """
+        path = "/assets/deposit-history"
+        params = {"ccy": coin, "limit": limit, "page": page}
         if chain:
             params["chain"] = chain
-        return await self._request("GET", path, params)
+        return self._request("GET", path, params=params)
 
-    async def withdraw(self, coin: str, to_address: str, amount: float, chain: str = None):
-        path = "/v2/account/withdraw"
-        params = {
-            "coin": coin,
-            "address": to_address,
-            "amount": str(amount),
-        }
+    def withdraw(self, coin: str, to_address: str, amount: float, chain: str = None, memo: str = None, extra: dict = None):
+        """
+        POST /v2/assets/withdraw
+        Body: ccy, to_address, amount, chain(optional), memo(optional)
+        """
+        path = "/assets/withdraw"
+        data = {"ccy": coin, "to_address": to_address, "amount": str(amount)}
         if chain:
-            params["chain"] = chain
-        return await self._request("POST", path, params)
-
-    async def get_balance(self):
-        path = "/v2/account/balance"
-        return await self._request("GET", path)
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
+            data["chain"] = chain
+        if memo:
+            data["memo"] = memo
+        if extra:
+            data["extra"] = extra
+        return self._request("POST", path, data=data)
 
 
+# Global client instance
 _coinex_client = None
+
 
 def get_coinex_client():
     global _coinex_client
     if _coinex_client is None:
-        if not config.COINEX_ACCESS_ID or not config.COINEX_SECRET_KEY:
-            raise ValueError("CoinEx API credentials not configured in config.py")
+        if not getattr(config, "COINEX_ACCESS_ID", None) or not getattr(config, "COINEX_SECRET_KEY", None):
+            raise ValueError("CoinEx credentials not set in config.py")
         _coinex_client = CoinExClient(
             access_id=config.COINEX_ACCESS_ID,
             secret_key=config.COINEX_SECRET_KEY
@@ -116,18 +142,20 @@ def get_coinex_client():
     return _coinex_client
 
 
-async def get_deposit_address(coin: str, chain: str):
+# Async wrappers for integration with async Telegram handlers
+async def get_deposit_address(coin: str, chain: str = None):
     client = get_coinex_client()
-    return await client.get_deposit_address(coin, chain)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: client.get_deposit_address(coin, chain))
 
-async def get_deposit_history(coin: str, chain: str = None, limit: int = 10):
-    client = get_coinex_client()
-    return await client.get_deposit_history(coin, chain, limit)
 
-async def withdraw_coinex(coin: str, to_address: str, amount: float, chain: str = None):
+async def get_deposit_history(coin: str, chain: str = None, limit: int = 10, page: int = 1):
     client = get_coinex_client()
-    return await client.withdraw(coin, to_address, amount, chain)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: client.get_deposit_history(coin, chain, limit, page))
 
-async def get_coinex_balance():
+
+async def withdraw_coinex(coin: str, to_address: str, amount: float, chain: str = None, memo: str = None):
     client = get_coinex_client()
-    return await client.get_balance()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: client.withdraw(coin, to_address, amount, chain, memo))
