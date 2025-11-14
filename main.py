@@ -9,6 +9,7 @@ from telegram.ext import (
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import config
+from utils.notifications import set_bot_instance
 
 # === استيراد جميع الهاندلرز ===
 from handlers.shamcash_deposit import register_handlers as register_shamcash_deposit
@@ -22,8 +23,6 @@ from handlers.coinex_withdraw import register_handlers as register_coinex_withdr
 from handlers.admin_transactions import register_handlers as register_admin_handlers
 from handlers.address_management import register_handlers as register_address_handlers
 from handlers.admin_setting_handler import register_handlers as register_admin_setting_handlers
-
-from utils.notifications import set_bot_instance
 
 
 # إعداد التسجيل
@@ -188,9 +187,14 @@ async def back_to_main(update: Update, context):
 #       MAIN APPLICATION
 # ==============================
 def main():
+    # تحقق من وجود التوكن قبل محاولة بناء الـ Application
+    if not config.TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not configured. ضع TELEGRAM_BOT_TOKEN في .env أو متغيرات البيئة.")
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # تمرير نسخة البوت
+    # تمرير نسخة البوت لوحدة الاشعارات (مهم ليعمل notify_user/notify_admin)
     set_bot_instance(application.bot)
 
     # أوامر
@@ -218,8 +222,15 @@ def main():
     register_address_handlers(application)
     register_admin_setting_handlers(application)
 
-    print("🤖 البوت يعمل الآن...")
-    application.run_polling()
+    try:
+        print("🤖 البوت يعمل الآن...")
+        application.run_polling()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.exception("Unhandled exception while running the bot: %s", e)
+    finally:
+        logger.info("Application stopped")
 
 
 if __name__ == "__main__":
